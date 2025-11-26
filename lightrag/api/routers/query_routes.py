@@ -4,9 +4,10 @@ This module contains all query-related routes for the LightRAG API.
 
 import json
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from lightrag.base import QueryParam
 from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.lightrag import LightRAG
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
 
@@ -190,8 +191,12 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def create_query_routes(rag_getter, api_key: Optional[str] = None, top_k: int = 60):
     combined_auth = get_combined_auth_dependency(api_key)
+    
+    # Create a dependency that gets the rag instance from the request
+    async def get_rag(request: Request):
+        return await rag_getter(request)
 
     @router.post(
         "/query",
@@ -322,7 +327,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(request: QueryRequest, rag: LightRAG = Depends(get_rag)):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -532,7 +537,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(request: QueryRequest, rag: LightRAG = Depends(get_rag)):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -1035,7 +1040,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_data(request: QueryRequest):
+    async def query_data(request: QueryRequest, rag: LightRAG = Depends(get_rag)):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
 

@@ -98,6 +98,7 @@ class PostgreSQLDB:
             TimeoutError,
             ConnectionError,
             OSError,
+            AttributeError,  # For Windows ProactorEventLoop issues
             asyncpg.exceptions.InterfaceError,
             asyncpg.exceptions.TooManyConnectionsError,
             asyncpg.exceptions.CannotConnectNowError,
@@ -404,7 +405,7 @@ class PostgreSQLDB:
                 'SET search_path = ag_catalog, "$user", public'
             )
             await connection.execute(  # type: ignore
-                f"select create_graph('{graph_name}')"
+                f"select ag_catalog.create_graph('{graph_name}')"
             )
         except (
             asyncpg.exceptions.InvalidSchemaNameError,
@@ -1516,11 +1517,11 @@ class PostgreSQLDB:
 
 
 class ClientManager:
-    _instances: dict[str, Any] = {"db": None, "ref_count": 0}
+    _instances: dict[str, dict[str, Any]] = {}  # 改为按工作区存储实例
     _lock = asyncio.Lock()
 
     @staticmethod
-    def get_config() -> dict[str, Any]:
+    def get_config(workspace: str | None = None) -> dict[str, Any]:
         config = configparser.ConfigParser()
         config.read("config.ini", "utf-8")
 
@@ -1543,7 +1544,7 @@ class ClientManager:
                 "POSTGRES_DATABASE",
                 config.get("postgres", "database", fallback="postgres"),
             ),
-            "workspace": os.environ.get(
+            "workspace": workspace or os.environ.get(
                 "POSTGRES_WORKSPACE",
                 config.get("postgres", "workspace", fallback=None),
             ),
@@ -1663,30 +1664,35 @@ class ClientManager:
         }
 
     @classmethod
-    async def get_client(cls) -> PostgreSQLDB:
+    async def get_client(cls, workspace: str | None = None) -> PostgreSQLDB:
+        # 使用工作区作为键，默认为"default"如果没有提供
+        workspace_key = workspace or "default"
+        
         async with cls._lock:
-            if cls._instances["db"] is None:
-                config = ClientManager.get_config()
+            if workspace_key not in cls._instances:
+                config = ClientManager.get_config(workspace)
                 db = PostgreSQLDB(config)
                 await db.initdb()
                 await db.check_tables()
-                cls._instances["db"] = db
-                cls._instances["ref_count"] = 0
-            cls._instances["ref_count"] += 1
-            return cls._instances["db"]
+                cls._instances[workspace_key] = {"db": db, "ref_count": 0}
+            
+            cls._instances[workspace_key]["ref_count"] += 1
+            return cls._instances[workspace_key]["db"]
 
     @classmethod
-    async def release_client(cls, db: PostgreSQLDB):
+    async def release_client(cls, db: PostgreSQLDB, workspace: str | None = None):
+        # 使用工作区作为键，默认为"default"如果没有提供
+        workspace_key = workspace or "default"
+        
         async with cls._lock:
-            if db is not None:
-                if db is cls._instances["db"]:
-                    cls._instances["ref_count"] -= 1
-                    if cls._instances["ref_count"] == 0:
+            if db is not None and workspace_key in cls._instances:
+                instance_entry = cls._instances[workspace_key]
+                if db is instance_entry["db"]:
+                    instance_entry["ref_count"] -= 1
+                    if instance_entry["ref_count"] == 0:
                         await db.pool.close()
-                        logger.info("Closed PostgreSQL database connection pool")
-                        cls._instances["db"] = None
-                else:
-                    await db.pool.close()
+                        logger.info(f"Closed PostgreSQL database connection pool for workspace: {workspace_key}")
+                        del cls._instances[workspace_key]
 
 
 @final
@@ -1700,7 +1706,8 @@ class PGKVStorage(BaseKVStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                # 传递当前工作区给ClientManager，确保每个工作区有独立的数据库实例
+                self.db = await ClientManager.get_client(self.workspace)
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
             if self.db.workspace:
@@ -1715,7 +1722,7 @@ class PGKVStorage(BaseKVStorage):
 
     async def finalize(self):
         if self.db is not None:
-            await ClientManager.release_client(self.db)
+            await ClientManager.release_client(self.db, self.workspace)
             self.db = None
 
     ################ QUERY METHODS ################
@@ -2193,7 +2200,8 @@ class PGVectorStorage(BaseVectorStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                # 传递当前工作区给ClientManager，确保每个工作区有独立的数据库实例
+                self.db = await ClientManager.get_client(self.workspace)
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
             if self.db.workspace:
@@ -2208,7 +2216,7 @@ class PGVectorStorage(BaseVectorStorage):
 
     async def finalize(self):
         if self.db is not None:
-            await ClientManager.release_client(self.db)
+            await ClientManager.release_client(self.db, self.workspace)
             self.db = None
 
     def _upsert_chunks(
@@ -2580,7 +2588,8 @@ class PGDocStatusStorage(DocStatusStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                # 传递当前工作区给ClientManager，确保每个工作区有独立的数据库实例
+                self.db = await ClientManager.get_client(self.workspace)
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
             if self.db.workspace:
@@ -2595,7 +2604,7 @@ class PGDocStatusStorage(DocStatusStorage):
 
     async def finalize(self):
         if self.db is not None:
-            await ClientManager.release_client(self.db)
+            await ClientManager.release_client(self.db, self.workspace)
             self.db = None
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
@@ -2786,6 +2795,13 @@ class PGDocStatusStorage(DocStatusStorage):
         self, status: DocStatus
     ) -> dict[str, DocProcessingStatus]:
         """all documents with a specific status"""
+        # Ensure db is initialized before proceeding
+        if self.db is None:
+            await self.initialize()
+        # If db still not initialized, return empty dict
+        if self.db is None:
+            return {}
+        
         sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and status=$2"
         params = {"workspace": self.workspace, "status": status.value}
         result = await self.db.query(sql, list(params.values()), True)
@@ -3224,19 +3240,40 @@ class PGGraphStorage(BaseGraphStorage):
             None
 
         Returns:
-            str: The graph name for the current workspace
+            str: The graph name for the current workspace, ensuring it meets PostgreSQL naming requirements
         """
         workspace = self.workspace
         namespace = self.namespace
-
-        if workspace and workspace.strip() and workspace.strip().lower() != "default":
-            # Ensure names comply with PostgreSQL identifier specifications
-            safe_workspace = re.sub(r"[^a-zA-Z0-9_]", "_", workspace.strip())
-            safe_namespace = re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
-            return f"{safe_workspace}_{safe_namespace}"
+        
+        # Get safe versions by replacing non-alphanumeric characters with underscores
+        safe_workspace = re.sub(r"[^a-zA-Z0-9_]", "_", workspace.strip()) if workspace else ""
+        safe_namespace = re.sub(r"[^a-zA-Z0-9_]", "_", namespace) if namespace else ""
+        
+        # Generate base graph name
+        if safe_workspace and safe_workspace.lower() != "default":
+            base_name = f"{safe_workspace}_{safe_namespace}"
         else:
-            # When the workspace is "default", use the namespace directly (for backward compatibility with legacy implementations)
-            return re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
+            base_name = safe_namespace
+        
+        # Ensure the graph name meets PostgreSQL requirements:
+        # 1. Must start with a letter or underscore
+        # 2. Must not be empty
+        # 3. Must be within 63 characters (PostgreSQL identifier limit)
+        if not base_name or not re.match(r"^[a-zA-Z_]", base_name):
+            # If empty or doesn't start with letter/underscore, use a default prefix
+            base_name = f"graph_{safe_workspace}_{safe_namespace}" if safe_workspace else "graph_{safe_namespace}"
+        
+        # Ensure it starts with letter/underscore after prefix
+        if not re.match(r"^[a-zA-Z_]", base_name):
+            base_name = f"g_{base_name}"
+        
+        # Limit to 63 characters
+        base_name = base_name[:63]
+        
+        # Final validation: ensure only valid characters remain
+        final_name = re.sub(r"[^a-zA-Z0-9_]", "_", base_name)
+        
+        return final_name
 
     @staticmethod
     def _normalize_node_id(node_id: str) -> str:
@@ -3258,7 +3295,8 @@ class PGGraphStorage(BaseGraphStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                # 传递当前工作区给ClientManager，确保每个工作区有独立的数据库实例
+                self.db = await ClientManager.get_client(self.workspace)
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
             if self.db.workspace:
@@ -3279,16 +3317,12 @@ class PGGraphStorage(BaseGraphStorage):
                 f"[{self.workspace}] PostgreSQL Graph initialized: graph_name='{self.graph_name}'"
             )
 
-            # Create AGE extension and configure graph environment once at initialization
-            async with self.db.pool.acquire() as connection:
-                # First ensure AGE extension is created
-                await PostgreSQLDB.configure_age_extension(connection)
-
             # Execute each statement separately and ignore errors
             queries = [
-                f"SELECT create_graph('{self.graph_name}')",
-                f"SELECT create_vlabel('{self.graph_name}', 'base');",
-                f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');",
+                "CREATE EXTENSION IF NOT EXISTS age",
+                f"SELECT ag_catalog.create_graph('{self.graph_name}')",
+                f"SELECT ag_catalog.create_vlabel('{self.graph_name}', 'base');",
+                f"SELECT ag_catalog.create_elabel('{self.graph_name}', 'DIRECTED');",
                 # f'CREATE INDEX CONCURRENTLY vertex_p_idx ON {self.graph_name}."_ag_label_vertex" (id)',
                 f'CREATE INDEX CONCURRENTLY vertex_idx_node_id ON {self.graph_name}."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
                 # f'CREATE INDEX CONCURRENTLY edge_p_idx ON {self.graph_name}."_ag_label_edge" (id)',
@@ -3318,7 +3352,7 @@ class PGGraphStorage(BaseGraphStorage):
 
     async def finalize(self):
         if self.db is not None:
-            await ClientManager.release_client(self.db)
+            await ClientManager.release_client(self.db, self.workspace)
             self.db = None
 
     async def index_done_callback(self) -> None:
@@ -4181,6 +4215,15 @@ class PGGraphStorage(BaseGraphStorage):
         Returns:
             list[str]: A list of all labels in the graph.
         """
+        # Ensure graph_name is set before proceeding
+        if not hasattr(self, 'graph_name') or self.graph_name is None:
+            # Initialize storage if not already initialized
+            if self.db is None:
+                await self.initialize()
+            # If graph_name still not set, skip
+            if not hasattr(self, 'graph_name') or self.graph_name is None:
+                return []
+        
         query = (
             """SELECT * FROM cypher('%s', $$
                      MATCH (n:base)

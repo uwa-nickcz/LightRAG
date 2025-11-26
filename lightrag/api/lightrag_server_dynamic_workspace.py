@@ -1,5 +1,6 @@
 """
-LightRAG FastAPI Server
+LightRAG FastAPI Server with Dynamic Workspace Support
+This version creates RAG instances on-demand based on workspace parameter from frontend
 """
 
 from fastapi import FastAPI, Depends, HTTPException, Request
@@ -28,7 +29,7 @@ from lightrag.api.utils_api import (
     display_splash_screen,
     check_env_file,
 )
-from config import (
+from lightrag.api.config import (
     global_args,
     update_uvicorn_mode_config,
     get_default_host,
@@ -153,6 +154,12 @@ class LLMConfigCache:
                     "GeminiEmbeddingOptions not available, using default configuration"
                 )
                 self.gemini_embedding_options = {}
+
+
+# 用于存储不同workspace的rag实例缓存
+rag_instances = {}
+# 用于线程安全的锁
+rag_lock = {}  # 为每个workspace提供独立的锁
 
 
 def check_frontend_build():
@@ -343,141 +350,13 @@ def create_app(args):
     # Initialize document manager with workspace support for data isolation
     doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        """Lifespan context manager for startup and shutdown events"""
-        # Store background tasks
-        app.state.background_tasks = set()
-
-        try:
-            # Initialize database connections
-            # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
-            await rag.initialize_storages()
-
-            # Data migration regardless of storage implementation
-            await rag.check_and_migrate_data()
-
-            ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
-
-            yield
-
-        finally:
-            # Clean up database connections
-            await rag.finalize_storages()
-
-            if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
-                # Only perform cleanup in Uvicorn single-process mode
-                logger.debug("Unvicorn Mode: finalizing shared storage...")
-                finalize_share_data()
-            else:
-                # In Gunicorn mode with preload_app=True, cleanup is handled by on_exit hooks
-                logger.debug(
-                    "Gunicorn Mode: postpone shared storage finalization to master process"
-                )
-
-    # Initialize FastAPI
-    base_description = (
-        "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
-    )
-    swagger_description = (
-        base_description
-        + (" (API-Key Enabled)" if api_key else "")
-        + "\n\n[View ReDoc documentation](/redoc)"
-    )
-    app_kwargs = {
-        "title": "LightRAG Server API",
-        "description": swagger_description,
-        "version": __api_version__,
-        "openapi_url": "/openapi.json",  # Explicitly set OpenAPI schema URL
-        "docs_url": None,  # Disable default docs, we'll create custom endpoint
-        "redoc_url": "/redoc",  # Explicitly set redoc URL
-        "lifespan": lifespan,
-    }
-
-    # Configure Swagger UI parameters
-    # Enable persistAuthorization and tryItOutEnabled for better user experience
-    app_kwargs["swagger_ui_parameters"] = {
-        "persistAuthorization": True,
-        "tryItOutEnabled": True,
-    }
-
-    app = FastAPI(**app_kwargs)
-
-    # Add custom validation error handler for /query/data endpoint
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(
-        request: Request, exc: RequestValidationError
-    ):
-        # Check if this is a request to /query/data endpoint
-        if request.url.path.endswith("/query/data"):
-            # Extract error details
-            error_details = []
-            for error in exc.errors():
-                field_path = " -> ".join(str(loc) for loc in error["loc"])
-                error_details.append(f"{field_path}: {error['msg']}")
-
-            error_message = "; ".join(error_details)
-
-            # Return in the expected format for /query/data
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "failure",
-                    "message": f"Validation error: {error_message}",
-                    "data": {},
-                    "metadata": {},
-                },
-            )
-        else:
-            # For other endpoints, return the default FastAPI validation error
-            return JSONResponse(status_code=422, content={"detail": exc.errors()})
-
-    def get_cors_origins():
-        """Get allowed origins from global_args
-        Returns a list of allowed origins, defaults to ["*"] if not set
-        """
-        origins_str = global_args.cors_origins
-        if origins_str == "*":
-            return ["*"]
-        return [origin.strip() for origin in origins_str.split(",")]
-
-    # Add CORS middleware
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=get_cors_origins(),
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+    # 初始化LLM超时和嵌入超时设置
+    llm_timeout = get_env_value("LLM_TIMEOUT", DEFAULT_LLM_TIMEOUT, int)
+    embedding_timeout = get_env_value(
+        "EMBEDDING_TIMEOUT", DEFAULT_EMBEDDING_TIMEOUT, int
     )
 
-    # Create combined auth dependency for all endpoints
-    combined_auth = get_combined_auth_dependency(api_key)
-
-    def get_workspace_from_request(request: Request) -> str | None:
-        """
-        Extract workspace from HTTP request header or use default.
-
-        This enables multi-workspace API support by checking the custom
-        'LIGHTRAG-WORKSPACE' header. If not present, falls back to the
-        server's default workspace configuration.
-
-        Args:
-            request: FastAPI Request object
-
-        Returns:
-            Workspace identifier (may be empty string for global namespace)
-        """
-        # Check custom header first
-        workspace = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
-
-        if not workspace:
-            workspace = None
-
-        return workspace
-
-    # Create working directory if it doesn't exist
-    Path(args.working_dir).mkdir(parents=True, exist_ok=True)
-
+    # 优化的LLM和嵌入函数创建方法 - 保持与原脚本相同
     def create_optimized_openai_llm_func(
         config_cache: LLMConfigCache, args, llm_timeout: int
     ):
@@ -590,6 +469,33 @@ def create_app(args):
             )
 
         return optimized_gemini_model_complete
+
+    async def bedrock_model_complete(
+        prompt,
+        system_prompt=None,
+        history_messages=None,
+        keyword_extraction=False,
+        **kwargs,
+    ) -> str:
+        # Lazy import
+        from lightrag.llm.bedrock import bedrock_complete_if_cache
+
+        keyword_extraction = kwargs.pop("keyword_extraction", None)
+        if keyword_extraction:
+            kwargs["response_format"] = GPTKeywordExtractionFormat
+        if history_messages is None:
+            history_messages = []
+
+        # Use global temperature for Bedrock
+        kwargs["temperature"] = get_env_value("BEDROCK_LLM_TEMPERATURE", 1.0, float)
+
+        return await bedrock_complete_if_cache(
+            args.llm_model,
+            prompt,
+            system_prompt=system_prompt,
+            history_messages=history_messages,
+            **kwargs,
+        )
 
     def create_llm_model_func(binding: str):
         """
@@ -840,38 +746,6 @@ def create_app(args):
 
         return embedding_func_instance
 
-    llm_timeout = get_env_value("LLM_TIMEOUT", DEFAULT_LLM_TIMEOUT, int)
-    embedding_timeout = get_env_value(
-        "EMBEDDING_TIMEOUT", DEFAULT_EMBEDDING_TIMEOUT, int
-    )
-
-    async def bedrock_model_complete(
-        prompt,
-        system_prompt=None,
-        history_messages=None,
-        keyword_extraction=False,
-        **kwargs,
-    ) -> str:
-        # Lazy import
-        from lightrag.llm.bedrock import bedrock_complete_if_cache
-
-        keyword_extraction = kwargs.pop("keyword_extraction", None)
-        if keyword_extraction:
-            kwargs["response_format"] = GPTKeywordExtractionFormat
-        if history_messages is None:
-            history_messages = []
-
-        # Use global temperature for Bedrock
-        kwargs["temperature"] = get_env_value("BEDROCK_LLM_TEMPERATURE", 1.0, float)
-
-        return await bedrock_complete_if_cache(
-            args.llm_model,
-            prompt,
-            system_prompt=system_prompt,
-            history_messages=history_messages,
-            **kwargs,
-        )
-
     # Create embedding function with optimized configuration and max_token_size inheritance
     import inspect
 
@@ -991,59 +865,363 @@ def create_app(args):
         name=args.simulated_model_name, tag=args.simulated_model_tag
     )
 
-    # Initialize RAG with unified configuration
-    try:
-        rag = LightRAG(
-            working_dir=args.working_dir,
-            workspace=args.workspace,
-            llm_model_func=create_llm_model_func(args.llm_binding),
-            llm_model_name=args.llm_model,
-            llm_model_max_async=args.max_async,
-            summary_max_tokens=args.summary_max_tokens,
-            summary_context_size=args.summary_context_size,
-            chunk_token_size=int(args.chunk_size),
-            chunk_overlap_token_size=int(args.chunk_overlap_size),
-            llm_model_kwargs=create_llm_model_kwargs(
-                args.llm_binding, args, llm_timeout
-            ),
-            embedding_func=embedding_func,
-            default_llm_timeout=llm_timeout,
-            default_embedding_timeout=embedding_timeout,
-            kv_storage=args.kv_storage,
-            graph_storage=args.graph_storage,
-            vector_storage=args.vector_storage,
-            doc_status_storage=args.doc_status_storage,
-            vector_db_storage_cls_kwargs={
-                "cosine_better_than_threshold": args.cosine_threshold
-            },
-            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
-            enable_llm_cache=args.enable_llm_cache,
-            rerank_model_func=rerank_model_func,
-            max_parallel_insert=args.max_parallel_insert,
-            max_graph_nodes=args.max_graph_nodes,
-            addon_params={
-                "language": args.summary_language,
-                "entity_types": args.entity_types,
-            },
-            ollama_server_infos=ollama_server_infos,
-        )
-    except Exception as e:
-        logger.error(f"Failed to initialize LightRAG: {e}")
-        raise
+    # 设置默认工作空间
+    from lightrag.kg.shared_storage import set_default_workspace
+    set_default_workspace("")  # 使用空字符串作为默认工作空间（全局命名空间）
+    
+    # 关键改进: 根据workspace动态创建和获取rag实例的函数
+    async def get_or_create_rag_instance(workspace: str) -> LightRAG:
+        """根据workspace参数获取或创建LightRAG实例
+        
+        Args:
+            workspace: 工作空间标识
+            
+        Returns:
+            LightRAG实例
+        """
+        import threading
+        
+        # 如果workspace为空，使用默认工作空间
+        if not workspace:
+            workspace = get_default_workspace()
+        
+        # 确保workspace不为None
+        if workspace is None:
+            workspace = ""  # 使用空字符串作为默认工作空间（全局命名空间）
+        
+        # 检查实例是否已存在
+        if workspace in rag_instances:
+            return rag_instances[workspace]
+        
+        # 为该workspace创建锁（如果不存在）
+        if workspace not in rag_lock:
+            rag_lock[workspace] = threading.RLock()
+        
+        # 使用锁确保线程安全地创建实例
+        with rag_lock[workspace]:
+            # 双重检查，避免其他线程已经创建了实例
+            if workspace in rag_instances:
+                return rag_instances[workspace]
+            
+            logger.info(f"Creating new LightRAG instance for workspace: {workspace}")
+            
+            # 创建新的rag实例
+            try:
+                rag = LightRAG(
+                    working_dir=args.working_dir,
+                    workspace=workspace,
+                    llm_model_func=create_llm_model_func(args.llm_binding),
+                    llm_model_name=args.llm_model,
+                    llm_model_max_async=args.max_async,
+                    summary_max_tokens=args.summary_max_tokens,
+                    summary_context_size=args.summary_context_size,
+                    chunk_token_size=int(args.chunk_size),
+                    chunk_overlap_token_size=int(args.chunk_overlap_size),
+                    llm_model_kwargs=create_llm_model_kwargs(
+                        args.llm_binding, args, llm_timeout
+                    ),
+                    embedding_func=embedding_func,
+                    default_llm_timeout=llm_timeout,
+                    default_embedding_timeout=embedding_timeout,
+                    kv_storage=args.kv_storage,
+                    graph_storage=args.graph_storage,
+                    vector_storage=args.vector_storage,
+                    doc_status_storage=args.doc_status_storage,
+                    vector_db_storage_cls_kwargs={
+                        "cosine_better_than_threshold": args.cosine_threshold
+                    },
+                    enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
+                    enable_llm_cache=args.enable_llm_cache,
+                    rerank_model_func=rerank_model_func,
+                    max_parallel_insert=args.max_parallel_insert,
+                    max_graph_nodes=args.max_graph_nodes,
+                    addon_params={
+                        "language": args.summary_language,
+                        "entity_types": args.entity_types,
+                    },
+                    ollama_server_infos=ollama_server_infos,
+                )
+                
+                # 初始化存储 - 直接使用await，因为现在在异步上下文中
+                await rag.initialize_storages()
+                await rag.check_and_migrate_data()
+                
+                # 存储实例到缓存
+                rag_instances[workspace] = rag
+                logger.info(f"LightRAG instance created successfully for workspace: {workspace}")
+                return rag
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize LightRAG for workspace {workspace}: {e}")
+                raise
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """Lifespan context manager for startup and shutdown events"""
+        # Store background tasks
+        app.state.background_tasks = set()
+
+        try:
+            # 注意：这里不再初始化特定的rag实例，而是在API调用时按需创建
+            ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
+
+            yield
+
+        finally:
+            # 清理所有已创建的rag实例
+            for workspace, rag in rag_instances.items():
+                try:
+                    await rag.finalize_storages()
+                    logger.info(f"Finalized storage for workspace: {workspace}")
+                except Exception as e:
+                    logger.error(f"Error finalizing storage for workspace {workspace}: {e}")
+            
+            # 清空实例缓存
+            rag_instances.clear()
+
+            if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
+                # Only perform cleanup in Uvicorn single-process mode
+                logger.debug("Unvicorn Mode: finalizing shared storage...")
+                finalize_share_data()
+            else:
+                # In Gunicorn mode with preload_app=True, cleanup is handled by on_exit hooks
+                logger.debug(
+                    "Gunicorn Mode: postpone shared storage finalization to master process"
+                )
+
+    # Initialize FastAPI
+    base_description = (
+        "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
+    )
+    swagger_description = (
+        base_description
+        + (" (API-Key Enabled)" if api_key else "")
+        + "\n\n[View ReDoc documentation](/redoc)"
+    )
+    app_kwargs = {
+        "title": "LightRAG Server API",
+        "description": swagger_description,
+        "version": __api_version__,
+        "openapi_url": "/openapi.json",  # Explicitly set OpenAPI schema URL
+        "docs_url": None,  # Disable default docs, we'll create custom endpoint
+        "redoc_url": "/redoc",  # Explicitly set redoc URL
+        "lifespan": lifespan,
+    }
+
+    # Configure Swagger UI parameters
+    # Enable persistAuthorization and tryItOutEnabled for better user experience
+    app_kwargs["swagger_ui_parameters"] = {
+        "persistAuthorization": True,
+        "tryItOutEnabled": True,
+    }
+
+    app = FastAPI(**app_kwargs)
+
+    # Add custom validation error handler for /query/data endpoint
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ):
+        # Check if this is a request to /query/data endpoint
+        if request.url.path.endswith("/query/data"):
+            # Extract error details
+            error_details = []
+            for error in exc.errors():
+                field_path = " -> ".join(str(loc) for loc in error["loc"])
+                error_details.append(f"{field_path}: {error['msg']}")
+
+            error_message = "; ".join(error_details)
+
+            # Return in the expected format for /query/data
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "failure",
+                    "message": f"Validation error: {error_message}",
+                    "data": {},
+                    "metadata": {},
+                },
+            )
+        else:
+            # For other endpoints, return the default FastAPI validation error
+            return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+    def get_cors_origins():
+        """Get allowed origins from global_args
+        Returns a list of allowed origins, defaults to ["*"] if not set
+        """
+        origins_str = global_args.cors_origins
+        if origins_str == "*":
+            return ["*"]
+        return [origin.strip() for origin in origins_str.split(",")]
+
+    # Add CORS middleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=get_cors_origins(),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Create combined auth dependency for all endpoints
+    combined_auth = get_combined_auth_dependency(api_key)
+
+    def get_workspace_from_request(request: Request) -> str | None:
+        """
+        Extract workspace from HTTP request header or use default.
+
+        This enables multi-workspace API support by checking the custom
+        'LIGHTRAG-WORKSPACE' header. If not present, falls back to the
+        server's default workspace configuration.
+
+        Args:
+            request: FastAPI Request object
+
+        Returns:
+            Workspace identifier (may be empty string for global namespace)
+        """
+        # Check custom header first
+        workspace = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
+
+        if not workspace:
+            workspace = None
+
+        return workspace
+
+    # Create working directory if it doesn't exist
+    Path(args.working_dir).mkdir(parents=True, exist_ok=True)
+
+    # 创建自定义路由，动态获取rag实例
+    async def get_rag_for_request(request: Request) -> LightRAG:
+        """从请求中获取workspace并返回对应的rag实例"""
+        workspace = get_workspace_from_request(request)
+        return await get_or_create_rag_instance(workspace)
+
+    # 为了使路由能够访问动态创建的rag实例，我们需要创建新的路由生成函数
+    def create_dynamic_document_routes(rag_getter, doc_manager, api_key):
+        """创建文档路由，使用传入的rag_getter函数获取rag实例"""
+        from lightrag.api.routers.document_routes import create_document_routes
+        
+        # 使用原始的create_document_routes函数，传入我们的rag_getter
+        return create_document_routes(rag_getter, doc_manager, api_key)
+
+    def create_dynamic_query_routes(rag_getter, api_key, top_k):
+        """创建查询路由，使用传入的rag_getter函数获取rag实例"""
+        from lightrag.api.routers.query_routes import create_query_routes
+        
+        # 使用原始的create_query_routes函数，传入我们的rag_getter
+        return create_query_routes(rag_getter, api_key, top_k)
+
+    def create_dynamic_graph_routes(rag_getter, api_key):
+        """创建图谱路由，使用传入的rag_getter函数获取rag实例"""
+        from lightrag.api.routers.graph_routes import create_graph_routes
+        
+        # 使用原始的create_graph_routes函数，传入我们的rag_getter
+        return create_graph_routes(rag_getter, api_key)
+
+    # 创建自定义OllamaAPI类，使用动态获取的rag实例
+    class DynamicOllamaAPI:
+        def __init__(self, rag_getter, top_k, api_key):
+            from fastapi import APIRouter
+            self.rag_getter = rag_getter
+            self.top_k = top_k
+            self.api_key = api_key
+            self.router = APIRouter(tags=["ollama"])
+            self.setup_routes()
+        
+        def setup_routes(self):
+            from lightrag.api.routers.ollama_api import (
+                OllamaVersionResponse, OllamaTagResponse, OllamaPsResponse,
+                OllamaGenerateRequest, OllamaGenerateResponse, OllamaChatRequest, OllamaChatResponse
+            )
+            from lightrag.api.utils_api import get_combined_auth_dependency
+            from fastapi import Depends, Request
+            import time
+            import json
+            import re
+            from fastapi.responses import StreamingResponse
+            import asyncio
+            from lightrag.utils import TiktokenTokenizer
+            
+            # Create combined auth dependency for Ollama API routes
+            combined_auth = get_combined_auth_dependency(self.api_key)
+            
+            @self.router.get("/version", dependencies=[Depends(combined_auth)])
+            async def get_version():
+                """Get Ollama version information"""
+                return OllamaVersionResponse(version="0.9.3")
+            
+            @self.router.get("/tags", dependencies=[Depends(combined_auth)])
+            async def get_tags(request: Request):
+                """Return available models acting as an Ollama server"""
+                rag = await self.rag_getter(request)
+                ollama_server_infos = rag.ollama_server_infos
+                return OllamaTagResponse(
+                    models=[
+                        {
+                            "name": ollama_server_infos.LIGHTRAG_MODEL,
+                            "model": ollama_server_infos.LIGHTRAG_MODEL,
+                            "modified_at": ollama_server_infos.LIGHTRAG_CREATED_AT,
+                            "size": ollama_server_infos.LIGHTRAG_SIZE,
+                            "digest": ollama_server_infos.LIGHTRAG_DIGEST,
+                            "details": {
+                                "parent_model": "",
+                                "format": "gguf",
+                                "family": ollama_server_infos.LIGHTRAG_NAME,
+                                "families": [ollama_server_infos.LIGHTRAG_NAME],
+                                "parameter_size": "13B",
+                                "quantization_level": "Q4_0",
+                            },
+                        }
+                    ]
+                )
+            
+            @self.router.get("/ps", dependencies=[Depends(combined_auth)])
+            async def get_running_models(request: Request):
+                """List Running Models - returns currently running models"""
+                rag = await self.rag_getter(request)
+                ollama_server_infos = rag.ollama_server_infos
+                return OllamaPsResponse(
+                    models=[
+                        {
+                            "name": ollama_server_infos.LIGHTRAG_MODEL,
+                            "model": ollama_server_infos.LIGHTRAG_MODEL,
+                            "size": ollama_server_infos.LIGHTRAG_SIZE,
+                            "digest": ollama_server_infos.LIGHTRAG_DIGEST,
+                            "details": {
+                                "parent_model": "",
+                                "format": "gguf",
+                                "family": "llama",
+                                "families": ["llama"],
+                                "parameter_size": "7.2B",
+                                "quantization_level": "Q4_0",
+                            },
+                            "expires_at": "2050-12-31T14:38:31.83753-07:00",
+                            "size_vram": ollama_server_infos.LIGHTRAG_SIZE,
+                        }
+                    ]
+                )
+            
+            # Simple estimate tokens function
+            def estimate_tokens(text):
+                """Estimate token count for text"""
+                try:
+                    tokenizer = TiktokenTokenizer()
+                    return tokenizer.get_token_count(text)
+                except:
+                    # Fallback: approximate 1 token = 4 chars
+                    return len(text) // 4
 
     # Add routes
     app.include_router(
-        create_document_routes(
-            rag,
-            doc_manager,
-            api_key,
-        )
+        create_dynamic_document_routes(get_rag_for_request, doc_manager, api_key)
     )
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
+    app.include_router(create_dynamic_query_routes(get_rag_for_request, api_key, args.top_k))
+    app.include_router(create_dynamic_graph_routes(get_rag_for_request, api_key))
 
     # Add Ollama API routes
-    ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
+    ollama_api = DynamicOllamaAPI(get_rag_for_request, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
 
     # Custom Swagger UI endpoint for offline support
@@ -1143,6 +1321,9 @@ def create_app(args):
             default_workspace = get_default_workspace()
             if workspace is None:
                 workspace = default_workspace
+            
+            # 动态获取或创建rag实例以获取状态
+            rag = await get_or_create_rag_instance(workspace)
             pipeline_status = await get_namespace_data(
                 "pipeline_status", workspace=workspace
             )
@@ -1199,6 +1380,7 @@ def create_app(args):
                 "auth_mode": auth_mode,
                 "pipeline_busy": pipeline_status.get("busy", False),
                 "keyed_locks": keyed_lock_info,
+                "active_workspaces": list(rag_instances.keys()),  # 新增: 显示当前活跃的工作空间
                 "core_version": core_version,
                 "api_version": api_version_display,
                 "webui_title": webui_title,
@@ -1367,7 +1549,7 @@ def check_and_install_dependencies():
 def main():
     # Explicitly initialize configuration for clarity
     # (The proxy will auto-initialize anyway, but this makes intent clear)
-    from config import initialize_config
+    from lightrag.api.config import initialize_config
 
     initialize_config()
 
@@ -1420,6 +1602,12 @@ def main():
     print(
         f"Starting Uvicorn server in single-process mode on {global_args.host}:{global_args.port}"
     )
+    
+    # Remove loop_factory parameter if present to ensure compatibility with different uvicorn versions
+    # This fixes the error: TypeError: _patch_asyncio.<locals>.run() got an unexpected keyword argument 'loop_factory'
+    if "loop_factory" in uvicorn_config:
+        del uvicorn_config["loop_factory"]
+    
     uvicorn.run(**uvicorn_config)
 
 

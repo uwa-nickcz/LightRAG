@@ -130,7 +130,7 @@ class MongoKVStorage(BaseKVStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                self.db = await ClientManager.get_client(self.workspace)
 
             self._data = await get_or_create_collection(self.db, self._collection_name)
             logger.debug(
@@ -139,7 +139,7 @@ class MongoKVStorage(BaseKVStorage):
 
     async def finalize(self):
         if self.db is not None:
-            await ClientManager.release_client(self.db)
+            await ClientManager.release_client(self.db, self.workspace)
             self.db = None
             self._data = None
 
@@ -356,7 +356,7 @@ class MongoDocStatusStorage(DocStatusStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                self.db = await ClientManager.get_client(self.workspace)
 
             self._data = await get_or_create_collection(self.db, self._collection_name)
 
@@ -369,7 +369,7 @@ class MongoDocStatusStorage(DocStatusStorage):
 
     async def finalize(self):
         if self.db is not None:
-            await ClientManager.release_client(self.db)
+            await ClientManager.release_client(self.db, self.workspace)
             self.db = None
             self._data = None
 
@@ -780,7 +780,7 @@ class MongoGraphStorage(BaseGraphStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                self.db = await ClientManager.get_client(self.workspace)
 
             self.collection = await get_or_create_collection(
                 self.db, self._collection_name
@@ -798,7 +798,7 @@ class MongoGraphStorage(BaseGraphStorage):
 
     async def finalize(self):
         if self.db is not None:
-            await ClientManager.release_client(self.db)
+            await ClientManager.release_client(self.db, self.workspace)
             self.db = None
             self.collection = None
             self.edge_collection = None
@@ -2107,7 +2107,7 @@ class MongoVectorDBStorage(BaseVectorStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                self.db = await ClientManager.get_client(self.workspace)
 
             self._data = await get_or_create_collection(self.db, self._collection_name)
 
@@ -2120,7 +2120,7 @@ class MongoVectorDBStorage(BaseVectorStorage):
 
     async def finalize(self):
         if self.db is not None:
-            await ClientManager.release_client(self.db)
+            await ClientManager.release_client(self.db, self.workspace)
             self.db = None
             self._data = None
 

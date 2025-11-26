@@ -4,9 +4,10 @@ This module contains all graph-related routes for the LightRAG API.
 
 from typing import Optional, Dict, Any
 import traceback
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from lightrag.lightrag import LightRAG
 from lightrag.utils import logger
 from ..utils_api import get_combined_auth_dependency
 
@@ -86,11 +87,15 @@ class RelationCreateRequest(BaseModel):
     )
 
 
-def create_graph_routes(rag, api_key: Optional[str] = None):
+def create_graph_routes(rag_getter, api_key: Optional[str] = None):
     combined_auth = get_combined_auth_dependency(api_key)
 
+    async def get_rag(request: Request):
+        """Get the RAG instance for the current request."""
+        return await rag_getter(request)
+
     @router.get("/graph/label/list", dependencies=[Depends(combined_auth)])
-    async def get_graph_labels():
+    async def get_graph_labels(request: Request):
         """
         Get all graph labels
 
@@ -98,6 +103,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             List[str]: List of graph labels
         """
         try:
+            rag = await rag_getter(request)
             return await rag.get_graph_labels()
         except Exception as e:
             logger.error(f"Error getting graph labels: {str(e)}")
@@ -108,6 +114,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
 
     @router.get("/graph/label/popular", dependencies=[Depends(combined_auth)])
     async def get_popular_labels(
+        request: Request,
         limit: int = Query(
             300, description="Maximum number of popular labels to return", ge=1, le=1000
         ),
@@ -122,6 +129,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             List[str]: List of popular labels sorted by degree (highest first)
         """
         try:
+            rag = await rag_getter(request)
             return await rag.chunk_entity_relation_graph.get_popular_labels(limit)
         except Exception as e:
             logger.error(f"Error getting popular labels: {str(e)}")
@@ -132,6 +140,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
 
     @router.get("/graph/label/search", dependencies=[Depends(combined_auth)])
     async def search_labels(
+        request: Request,
         q: str = Query(..., description="Search query string"),
         limit: int = Query(
             50, description="Maximum number of search results to return", ge=1, le=100
@@ -148,6 +157,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             List[str]: List of matching labels sorted by relevance
         """
         try:
+            rag = await rag_getter(request)
             return await rag.chunk_entity_relation_graph.search_labels(q, limit)
         except Exception as e:
             logger.error(f"Error searching labels with query '{q}': {str(e)}")
@@ -158,6 +168,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
 
     @router.get("/graphs", dependencies=[Depends(combined_auth)])
     async def get_knowledge_graph(
+        request: Request,
         label: str = Query(..., description="Label to get knowledge graph for"),
         max_depth: int = Query(3, description="Maximum depth of graph", ge=1),
         max_nodes: int = Query(1000, description="Maximum nodes to return", ge=1),
@@ -181,6 +192,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             logger.debug(
                 f"get_knowledge_graph called with label: '{label}' (length: {len(label)}, repr: {repr(label)})"
             )
+            rag = await rag_getter(request)
 
             return await rag.get_knowledge_graph(
                 node_label=label,
@@ -196,6 +208,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
 
     @router.get("/graph/entity/exists", dependencies=[Depends(combined_auth)])
     async def check_entity_exists(
+        request: Request,
         name: str = Query(..., description="Entity name to check"),
     ):
         """
@@ -208,6 +221,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             Dict[str, bool]: Dictionary with 'exists' key indicating if entity exists
         """
         try:
+            rag = await rag_getter(request)
             exists = await rag.chunk_entity_relation_graph.has_node(name)
             return {"exists": exists}
         except Exception as e:
@@ -218,7 +232,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             )
 
     @router.post("/graph/entity/edit", dependencies=[Depends(combined_auth)])
-    async def update_entity(request: EntityUpdateRequest):
+    async def update_entity(http_request: Request, request: EntityUpdateRequest):
         """
         Update an entity's properties in the knowledge graph
 
@@ -353,6 +367,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         """
         try:
+            rag = rag_getter(http_request)
             result = await rag.aedit_entity(
                 entity_name=request.entity_name,
                 updated_data=request.updated_data,
@@ -408,7 +423,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             )
 
     @router.post("/graph/relation/edit", dependencies=[Depends(combined_auth)])
-    async def update_relation(request: RelationUpdateRequest):
+    async def update_relation(http_request: Request, request: RelationUpdateRequest):
         """Update a relation's properties in the knowledge graph
 
         Args:
@@ -418,6 +433,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             Dict: Updated relation information
         """
         try:
+            rag = rag_getter(http_request)
             result = await rag.aedit_relation(
                 source_entity=request.source_id,
                 target_entity=request.target_id,
