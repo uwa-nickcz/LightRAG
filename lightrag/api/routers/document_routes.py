@@ -29,6 +29,12 @@ from lightrag.utils import generate_track_id
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
 
+# Try to import chardet for encoding detection
+try:
+    import chardet
+except ImportError:
+    chardet = None
+
 
 @lru_cache(maxsize=1)
 def _is_docling_available() -> bool:
@@ -1299,8 +1305,28 @@ async def pipeline_enqueue_file(
                     | ".less"
                 ):
                     try:
-                        # Try to decode as UTF-8
-                        content = file.decode("utf-8")
+                        # Try to decode as UTF-8 first
+                        try:
+                            content = file.decode("utf-8")
+                        except UnicodeDecodeError:
+                            # If UTF-8 fails, try to detect encoding
+                            if chardet:
+                                detected = chardet.detect(file)
+                                encoding = detected.get('encoding', 'utf-8')
+                                logger.info(f"[File Extraction]Detected encoding {encoding} for file {file_path.name}")
+                                content = file.decode(encoding, errors='replace')
+                            else:
+                                # If chardet not available, try common encodings
+                                for encoding in ['utf-8-sig', 'gbk', 'gb2312', 'big5', 'latin-1']:
+                                    try:
+                                        content = file.decode(encoding)
+                                        logger.info(f"[File Extraction]Successfully decoded {file_path.name} with {encoding}")
+                                        break
+                                    except UnicodeDecodeError:
+                                        continue
+                                else:
+                                    # All encodings failed, raise error
+                                    raise
 
                         # Validate content
                         if not content or len(content.strip()) == 0:
@@ -2144,6 +2170,150 @@ def create_document_routes(
             logger.error(f"Error /documents/upload: {file.filename}: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+
+    class UrlItem(BaseModel):
+        url: str = Field(..., description="File download URL")
+        track_id: Optional[str] = Field(None, description="Optional track ID for the file")
+        file_name: str = Field(..., description="File name to use for saving")
+
+    class FileDownloadUrls(BaseModel):
+        urls: List[UrlItem] = Field(..., description="List of file download URL objects")
+        token: Optional[str] = Field(None, description="Token for authentication when downloading files")
+
+    @router.post(
+        "/upload-from-urls", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
+    )
+    async def upload_from_urls(
+        background_tasks: BackgroundTasks, urls_data: FileDownloadUrls, rag: LightRAG = Depends(get_rag)
+    ):
+        """
+        Download files from provided URLs and index them.
+
+        This API endpoint accepts a list of file download URL objects, downloads the files,
+        checks if they are of supported types, saves them in the specified input directory,
+        indexes them for retrieval, and returns a success status with relevant details.
+
+        Args:
+            background_tasks: FastAPI BackgroundTasks for async processing
+            urls_data: FileDownloadUrls containing list of file download URL objects
+            rag: LightRAG instance
+
+        Returns:
+            InsertResponse: A response object containing the upload status and a message.
+                status can be "success", "partial_success", or "failure".
+
+        Raises:
+            HTTPException: If any error occurs during processing (500).
+        """
+        import aiohttp
+
+        
+        if not urls_data.urls:
+            return InsertResponse(
+                status="failure",
+                message="No URLs provided for download.",
+                track_id="",
+            )
+
+        success_count = 0
+        error_count = 0
+        duplicated_count = 0
+        all_files = []
+        file_track_ids = {}
+        
+        async with aiohttp.ClientSession() as session:
+            for url_item in urls_data.urls:
+                try:
+                    # Get filename from the url_item instead of extracting from URL
+                    filename = url_item.file_name
+                    if not filename:
+                        error_count += 1
+                        continue
+
+                    # Sanitize filename to prevent Path Traversal attacks
+                    safe_filename = sanitize_filename(filename, doc_manager.input_dir)
+
+                    if not doc_manager.is_supported_file(safe_filename):
+                        error_count += 1
+                        continue
+
+                    # Check if filename already exists in doc_status storage
+                    existing_doc_data = await rag.doc_status.get_doc_by_file_path(safe_filename)
+                    if existing_doc_data:
+                        duplicated_count += 1
+                        continue
+
+                    file_path = doc_manager.input_dir / safe_filename
+                    # Check if file already exists in file system
+                    if file_path.exists():
+                        duplicated_count += 1
+                        continue
+
+                    # Prepare headers with token if provided
+                    headers = {}
+                    if urls_data.token:
+                        headers["Authorization"] = f"Bearer {urls_data.token}"
+                    
+                    # Download the file with token authentication
+                    async with session.get(url_item.url, headers=headers) as response:
+                        response.raise_for_status()
+                        with open(file_path, "wb") as f:
+                            f.write(await response.read())
+                    
+                    all_files.append(file_path)
+                    # Store the track_id for this file, generate one if not provided
+                    file_track_ids[file_path] = url_item.track_id or generate_track_id("upload_from_urls")
+                    success_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error downloading file from {url_item.url}: {str(e)}")
+                    error_count += 1
+        
+        # Process downloaded files after all URLs are processed
+        if all_files:
+            # Generate a default track_id if needed
+            default_track_id = generate_track_id("upload_from_urls")
+            
+            async def process_all_files():
+                """Process all downloaded files in one batch, ensuring each has unique track_id"""
+                try:
+                    # Enqueue all files first, each with its unique track_id
+                    enqueued_files = []
+                    for file_path in all_files:
+                        # Each file has a unique track_id stored in file_track_ids
+                        track_id = file_track_ids[file_path]
+                        success, returned_track_id = await pipeline_enqueue_file(rag, file_path, track_id)
+                        if success:
+                            enqueued_files.append(file_path)
+                    
+                    # Process all enqueued files at once
+                    if enqueued_files:
+                        await rag.apipeline_process_enqueue_documents()
+                except Exception as e:
+                    logger.error(f"Error processing files in batch: {str(e)}")
+                    logger.error(traceback.format_exc())
+            
+            # Add a single background task to process all files
+            background_tasks.add_task(process_all_files)
+            
+            if success_count == len(urls_data.urls):
+                return InsertResponse(
+                    status="success",
+                    message=f"All {success_count} files downloaded successfully. Processing will continue in background.",
+                    track_id=default_track_id,
+                )
+            else:
+                return InsertResponse(
+                    status="partial_success",
+                    message=f"Downloaded {success_count} files, {duplicated_count} duplicated, {error_count} failed. Processing will continue in background.",
+                    track_id=default_track_id,
+                )
+        else:
+            return InsertResponse(
+                status="failure",
+                message=f"Failed to download any files. {duplicated_count} duplicated, {error_count} failed.",
+                track_id="",
+            )
 
     @router.post(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
